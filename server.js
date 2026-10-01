@@ -14,56 +14,49 @@ app.get('/api/vendedores-cidades', async (req, res) => {
     const { vendedor } = req.query;
 
     if (!vendedor) {
-      // Busca vendedores das duas tabelas para não perder nada
-      const { data: dataClientes } = await supabase.from('clientes').select('vendedor_responsavel');
-      const { data: dataRotas } = await supabase.from('clientes_rotas').select('vendedor_nome');
+      // Procura vendedores em ambas as tabelas ('clientes' e 'clientes_rotas')
+      const { data: d1 } = await supabase.from('clientes').select('vendedor_responsavel');
+      const { data: d2 } = await supabase.from('clientes_rotas').select('vendedor_nome');
 
       const vendedores = new Set();
-      (dataClientes || []).forEach(i => i.vendedor_responsavel && vendedores.add(i.vendedor_responsavel));
-      (dataRotas || []).forEach(i => i.vendedor_nome && vendedores.add(i.vendedor_nome));
+      (d1 || []).forEach(i => i.vendedor_responsavel && vendedores.add(i.vendedor_responsavel));
+      (d2 || []).forEach(i => i.vendedor_nome && vendedores.add(i.vendedor_nome));
 
       return res.json([...vendedores].sort());
     }
 
-    // Busca os dias/rotas cadastrados para este vendedor (prioriza a tabela 'clientes')
-    const { data: rotasClientes } = await supabase
+    // Procura os dias/rotas do vendedor em ambas as tabelas
+    const { data: r1 } = await supabase
       .from('clientes')
       .select('dia_semana')
       .ilike('vendedor_responsavel', vendedor);
 
-    const { data: rotasAntigas } = await supabase
+    const { data: r2 } = await supabase
       .from('clientes_rotas')
       .select('dia_semana')
       .ilike('vendedor_nome', vendedor);
 
     const rotasUnicas = new Set();
-    (rotasClientes || []).forEach(i => i.dia_semana && rotasUnicas.add(i.dia_semana));
-    (rotasAntigas || []).forEach(i => i.dia_semana && rotasUnicas.add(i.dia_semana));
+    (r1 || []).forEach(i => i.dia_semana && rotasUnicas.add(i.dia_semana));
+    (r2 || []).forEach(i => i.dia_semana && rotasUnicas.add(i.dia_semana));
 
-    res.json([...rotasUnicas].filter(Boolean));
+    return res.json([...rotasUnicas].filter(Boolean));
   } catch (err) {
-    res.status(500).json({ ok: false, erro: err.message });
+    return res.status(500).json({ ok: false, erro: err.message });
   }
 });
 
-// 2. Lista os Clientes do Vendedor na Rota Selecionada (Agrupados por Cidade)
+// 2. Lista os Clientes (Retorna SEMPRE uma estrutura válida de blocos de cidades)
 app.get('/api/clientes', async (req, res) => {
   try {
     const { vendedor, dia_semana } = req.query;
 
-    if (!vendedor) {
-      // Se chamado sem vendedor, retorna a lista bruta dos clientes
-      const { data, error } = await supabase.from('clientes').select('*').order('nome', { ascending: true });
-      if (error) throw error;
-      return res.json(data);
+    // Consulta a tabela principal 'clientes'
+    let queryClientes = supabase.from('clientes').select('*').order('ordem', { ascending: true });
+
+    if (vendedor) {
+      queryClientes = queryClientes.ilike('vendedor_responsavel', vendedor);
     }
-
-    // Busca na tabela 'clientes' (onde o escritório cadastra)
-    let queryClientes = supabase
-      .from('clientes')
-      .select('*')
-      .ilike('vendedor_responsavel', vendedor);
-
     if (dia_semana) {
       queryClientes = queryClientes.ilike('dia_semana', dia_semana);
     }
@@ -71,17 +64,12 @@ app.get('/api/clientes', async (req, res) => {
     let { data: listaClientes, error } = await queryClientes;
     if (error) throw error;
 
-    // Se não achar na tabela nova 'clientes', tenta buscar na tabela antiga 'clientes_rotas'
-    if (!listaClientes || listaClientes.length === 0) {
-      let queryRotas = supabase
-        .from('clientes_rotas')
-        .select('*')
-        .ilike('vendedor_nome', vendedor);
-
+    // Fallback para a tabela 'clientes_rotas' se não houver dados na tabela principal
+    if ((!listaClientes || listaClientes.length === 0) && vendedor) {
+      let queryRotas = supabase.from('clientes_rotas').select('*').ilike('vendedor_nome', vendedor);
       if (dia_semana) {
         queryRotas = queryRotas.ilike('dia_semana', dia_semana);
       }
-
       const { data: dataRotas } = await queryRotas;
       if (dataRotas && dataRotas.length > 0) {
         listaClientes = dataRotas.map(r => ({
@@ -90,22 +78,28 @@ app.get('/api/clientes', async (req, res) => {
           cidade: r.cidade,
           endereco: r.endereco,
           vendedor_responsavel: r.vendedor_nome,
-          dia_semana: r.dia_semana
+          dia_semana: r.dia_semana,
+          ordem: 1
         }));
       }
     }
 
-    // Agrupa os clientes por cidade no formato exato que o app web espera
+    if (!listaClientes) listaClientes = [];
+
+    // Agrupa sempre por cidade no formato [ { cidade, clientes: [...] } ]
     const cidadesAgrupadas = {};
-    (listaClientes || []).forEach(cli => {
-      const cid = (cli.cidade || 'GERAL').toUpperCase();
+    listaClientes.forEach(cli => {
+      const cid = (cli.cidade || 'OUTROS').toUpperCase();
       if (!cidadesAgrupadas[cid]) {
         cidadesAgrupadas[cid] = [];
       }
       cidadesAgrupadas[cid].push({
         id: cli.id,
-        nome: cli.nome || cli.nome_cliente,
+        nome: cli.nome || cli.nome_cliente || '',
         endereco: cli.endereco || '',
+        vendedor_responsavel: cli.vendedor_responsavel || cli.vendedor_nome || '',
+        dia_semana: cli.dia_semana || '',
+        ordem: cli.ordem || 1,
         status: 'pendente',
         venda: null
       });
@@ -116,13 +110,15 @@ app.get('/api/clientes', async (req, res) => {
       clientes: cidadesAgrupadas[cidade]
     }));
 
-    res.json(resultado);
+    return res.json(resultado);
   } catch (err) {
-    res.status(500).json({ ok: false, erro: err.message });
+    console.error("Erro em GET /api/clientes:", err);
+    // Retorna array vazio para nunca quebrar a interface web
+    return res.json([]);
   }
 });
 
-// 3. Cadastrar Novo Cliente (Resolve o Erro 404 ao Salvar)
+// 3. Guardar Novo Cliente (POST /api/clientes)
 app.post('/api/clientes', async (req, res) => {
   try {
     const { nome, vendedor_responsavel, dia_semana, cidade, endereco, ordem } = req.body;
@@ -133,19 +129,19 @@ app.post('/api/clientes', async (req, res) => {
       dia_semana: dia_semana || '',
       cidade: (cidade || '').toUpperCase(),
       endereco: endereco || '',
-      ordem: ordem || 1
+      ordem: parseInt(ordem) || 1
     };
 
     const { data, error } = await supabase.from('clientes').insert([payload]).select();
     if (error) throw error;
 
-    res.json({ ok: true, mensagem: "Cliente salvo com sucesso!", cliente: data[0] });
+    return res.json({ ok: true, mensagem: "Cliente guardado com sucesso!", cliente: data ? data[0] : null });
   } catch (err) {
-    res.status(500).json({ ok: false, erro: err.message });
+    return res.status(500).json({ ok: false, erro: err.message });
   }
 });
 
-// 4. Editar Cliente Existente
+// 4. Editar Cliente Existente (PUT /api/clientes/:id)
 app.put('/api/clientes/:id', async (req, res) => {
   try {
     const { id } = req.params;
@@ -157,29 +153,42 @@ app.put('/api/clientes/:id', async (req, res) => {
       dia_semana: dia_semana || '',
       cidade: (cidade || '').toUpperCase(),
       endereco: endereco || '',
-      ordem: ordem || 1
+      ordem: parseInt(ordem) || 1
     };
 
     const { data, error } = await supabase.from('clientes').update(payload).eq('id', id).select();
     if (error) throw error;
 
-    res.json({ ok: true, mensagem: "Cliente atualizado com sucesso!", cliente: data });
+    return res.json({ ok: true, mensagem: "Cliente atualizado com sucesso!", cliente: data });
   } catch (err) {
-    res.status(500).json({ ok: false, erro: err.message });
+    return res.status(500).json({ ok: false, erro: err.message });
   }
 });
 
-// 5. Recebe o Fechamento do Dia para o Painel do Escritório
+// 5. Apagar Cliente (DELETE /api/clientes/:id)
+app.delete('/api/clientes/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { error } = await supabase.from('clientes').delete().eq('id', id);
+    if (error) throw error;
+
+    return res.json({ ok: true, mensagem: "Cliente eliminado com sucesso!" });
+  } catch (err) {
+    return res.status(500).json({ ok: false, erro: err.message });
+  }
+});
+
+// 6. Receber Fechamento do Dia
 app.post('/api/finalizar-rota', async (req, res) => {
   try {
     const dadosVenda = req.body;
     console.log("Fechamento recebido para o Painel do Escritório:", JSON.stringify(dadosVenda, null, 2));
     
-    res.json({ ok: true, mensagem: "Fechamento registrado com sucesso no painel!" });
+    return res.json({ ok: true, mensagem: "Fechamento registrado com sucesso no painel!" });
   } catch (err) {
-    res.status(500).json({ ok: false, erro: err.message });
+    return res.status(500).json({ ok: false, erro: err.message });
   }
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Servidor rodando na porta ${PORT}`));
+app.listen(PORT, () => console.log(`Servidor a rodar na porta ${PORT}`));
